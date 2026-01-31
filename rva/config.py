@@ -3,7 +3,7 @@ RVA Configuration — all architectural hyperparameters.
 Defaults target ~1M total parameters.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -28,7 +28,7 @@ class RVAConfig:
     max_recursion_depth: int = 512  # Hard ceiling on recursion
     min_recursion_depth: int = 4    # Always do at least this many steps
     halt_threshold: float = 0.95    # Cumulative halt probability to stop
-    ema_decay: float = 0.95         # Cross-recursion state EMA
+    ema_blend: float = 0.1          # Blend factor for cross-recursion EMA into state
 
     # --- Self-improvement ---
     improvement_lr: float = 1e-3    # Base learning rate for self-improvement

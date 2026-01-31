@@ -16,10 +16,8 @@ Usage:
 """
 
 import argparse
-import math
 import time
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
@@ -116,10 +114,11 @@ def train_epoch(
 
         # Add improvement quality loss during training
         improve_loss = model.self_improve.get_improvement_loss(output.improvement_signal)
-        total = losses["total"] + config.meta_loss_weight * improve_loss
+        losses["improve"] = improve_loss
+        losses["total"] = losses["total"] + config.meta_loss_weight * improve_loss
 
         # Backward
-        total.backward()
+        losses["total"].backward()
 
         # Gradient clipping for stability in deep recursion
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
@@ -161,6 +160,7 @@ def evaluate(
     loader: DataLoader,
     config: RVAConfig,
     device: torch.device,
+    max_val: int = 64,
 ) -> dict:
     """Evaluate the model."""
     model.eval()
@@ -182,9 +182,9 @@ def evaluate(
         total_steps += stats["mean_depth"]
         num_batches += 1
 
-        # Approximate accuracy (for discrete tasks)
-        pred = (output.logits * 64).round()
-        tgt = (targets * 64).round()
+        # Approximate accuracy (for discrete tasks, round to original int scale)
+        pred = (output.logits * max_val).round()
+        tgt = (targets * max_val).round()
         total_correct += (pred == tgt).float().sum().item()
         total_elements += targets.numel()
 

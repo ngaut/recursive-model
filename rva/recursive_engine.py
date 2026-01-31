@@ -59,7 +59,6 @@ class RecursiveEngine(nn.Module):
 
         # State normalization for stability in deep recursion
         self.state_norm = nn.LayerNorm(config.state_dim)
-        self.memory_norm = nn.LayerNorm(config.memory_dim)
 
         # Learned EMA rate for cross-recursion smoothing
         self.ema_logit = nn.Parameter(torch.tensor(2.0))  # sigmoid(2) ≈ 0.88
@@ -100,7 +99,6 @@ class RecursiveEngine(nn.Module):
 
         # Halting bookkeeping (ACT)
         cumulative_halt = torch.zeros(batch_size, 1, device=device)
-        remainder = torch.zeros(batch_size, 1, device=device)
         num_steps = torch.zeros(batch_size, device=device)
 
         # Improvement accumulation
@@ -127,8 +125,12 @@ class RecursiveEngine(nn.Module):
             modulation = self.variant_gen(normed_state, depth, training=training)
 
             # 2. Apply kernel with variant modulation
-            normed_memory = self.memory_norm(memory)
-            kernel_out: KernelOutput = self.kernel(normed_state, normed_memory, modulation)
+            #    Pass raw memory so the kernel's gated residual operates on
+            #    unnormed memory (consistent with the state residual path).
+            #    The kernel's first layer receives the concat of normed_state,
+            #    raw memory, and context — the FiLMLayer's internal LayerNorm
+            #    handles normalization of the combined input.
+            kernel_out: KernelOutput = self.kernel(normed_state, memory, modulation)
 
             # 3. Gated residual state update
             new_state = state + kernel_out.gate * (kernel_out.state - state)
@@ -138,7 +140,7 @@ class RecursiveEngine(nn.Module):
             ema_state = ema_rate * ema_state + (1 - ema_rate) * new_state
 
             # Blend in EMA to prevent drift (small contribution)
-            new_state = new_state + 0.1 * (ema_state - new_state)
+            new_state = new_state + config.ema_blend * (ema_state - new_state)
 
             new_memory = kernel_out.memory
 

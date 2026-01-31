@@ -16,7 +16,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 from rva.config import RVAConfig
 from rva.genome_kernel import VariantModulation
@@ -136,8 +135,6 @@ class VariantGenerator(nn.Module):
         Returns:
             VariantModulation with FiLM params and context
         """
-        batch_size = state.shape[0]
-
         # 1. Get depth embedding (free — no parameters)
         depth_emb = sinusoidal_embedding(depth, self.config.depth_embed_dim)
 
@@ -155,7 +152,13 @@ class VariantGenerator(nn.Module):
         # 5. Compress to variant code (bottleneck)
         code = self.to_code(h)  # [batch, variant_code_dim]
 
-        # 6. Generate FiLM parameters per kernel layer from the compact code
+        # 6. Add noise during training for regularization.
+        #    Applied BEFORE FiLM generation so noise affects all variant outputs
+        #    (gammas, betas, and context), not just context.
+        if training and self.config.variant_noise > 0:
+            code = code + torch.randn_like(code) * self.config.variant_noise
+
+        # 7. Generate FiLM parameters per kernel layer from the (possibly noised) code
         gammas = []
         betas = []
         for proj in self.film_projections:
@@ -166,12 +169,8 @@ class VariantGenerator(nn.Module):
             gammas.append(gamma)
             betas.append(beta)
 
-        # 7. The code itself serves as the context vector
+        # 8. The code itself serves as the context vector
         context = code
-
-        # 7. Add noise during training for regularization
-        if training and self.config.variant_noise > 0:
-            context = context + torch.randn_like(context) * self.config.variant_noise
 
         return VariantModulation(
             gammas=gammas,

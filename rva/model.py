@@ -251,8 +251,6 @@ class RVAModel(nn.Module):
             "recursive_engine_other": nn.ParameterList([
                 self.recursive_engine.state_norm.weight,
                 self.recursive_engine.state_norm.bias,
-                self.recursive_engine.memory_norm.weight,
-                self.recursive_engine.memory_norm.bias,
                 self.recursive_engine.ema_logit,
             ]),
             "decoder": self.decoder,

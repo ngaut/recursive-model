@@ -134,9 +134,9 @@ class SelfImprovementEngine(nn.Module):
 
         updates, plasticity = self.compute_update(improvement_signal)
 
-        # Apply momentum
+        # Apply momentum (in-place to preserve registered buffer)
         momentum = self.config.improvement_momentum
-        self.momentum_buffer = momentum * self.momentum_buffer + (1 - momentum) * updates
+        self.momentum_buffer.mul_(momentum).add_(updates, alpha=1 - momentum)
 
         # Scale by plasticity (per-prototype adaptive LR)
         scaled_update = self.momentum_buffer * plasticity.unsqueeze(-1)

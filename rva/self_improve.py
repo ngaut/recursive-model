@@ -50,22 +50,25 @@ class SelfImprovementEngine(nn.Module):
             nn.LayerNorm(config.variant_code_dim),
         )
 
-        # Plasticity controller — learns an adaptive learning rate
-        # Input: improvement signal statistics
-        # Output: scalar plasticity per prototype
-        self.plasticity_net = nn.Sequential(
-            nn.Linear(config.variant_code_dim, config.variant_code_dim),
+        # Per-Prototype Plasticity Head
+        # Input: [B, K, D] (distributed improvement signal per prototype)
+        # Output: [B, K] (plasticity scalar per prototype)
+        # We use a shared MLP applied to the last dimension.
+        self.plasticity_head = nn.Sequential(
+            nn.Linear(config.variant_code_dim, config.variant_code_dim // 2),
             nn.GELU(),
-            nn.Linear(config.variant_code_dim, config.num_variant_prototypes),
+            nn.Linear(config.variant_code_dim // 2, 1),
             nn.Sigmoid(),  # Output in [0, 1]
         )
+        # Initialize plasticity to be high (sigmoid(2.0) ~= 0.88) to encourage early exploration
+        nn.init.constant_(self.plasticity_head[2].bias, 2.0)
 
         # Factored prototype updates: instead of one massive projection to
         # (num_prototypes * code_dim), we factor as outer product of:
         #   key: which prototypes to update  [num_prototypes]
         #   val: what direction to update    [code_dim]
         # This is O(K + D) parameters instead of O(K * D).
-        self.update_key = nn.Linear(config.variant_code_dim, config.num_variant_prototypes)
+        # self.update_key = nn.Linear(config.variant_code_dim, config.num_variant_prototypes)
         self.update_val = nn.Linear(config.variant_code_dim, config.variant_code_dim)
 
         # Momentum buffer (not a parameter — state for inference-time improvement)
@@ -78,37 +81,64 @@ class SelfImprovementEngine(nn.Module):
     def compute_update(
         self,
         improvement_signal: torch.Tensor,
+        average_updates: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the update for variant memory (but don't apply it yet).
 
         Args:
-            improvement_signal: [batch, variant_code_dim] from recursive engine
+            improvement_signal: [batch, num_prototypes, code_dim]
+            average_updates: if True, return mean update [K, D]
+                           if False, return batched update [B, K, D]
 
         Returns:
-            update: [num_prototypes, variant_code_dim] — the proposed update
-            plasticity: [num_prototypes] — per-prototype learning rates
+            update: [K, D] or [B, K, D]
+            plasticity: [K] or [B, K]
         """
-        # Average over batch (improvement direction should be consistent)
-        mean_signal = improvement_signal.mean(dim=0, keepdim=True)  # [1, code_dim]
+        # improvement_signal is [B, K, D] - distributed per prototype.
 
-        # Process through aggregator
-        clean_signal = self.aggregator(mean_signal)  # [1, code_dim]
+        # Process through aggregator (applied to last dim code_dim)
+        clean_signal = self.aggregator(improvement_signal)  # [B, K, D]
 
-        # Compute per-prototype plasticity
-        plasticity = self.plasticity_net(clean_signal).squeeze(0)  # [num_prototypes]
+        # Compute per-prototype plasticity using the dedicated head
+        # plasticity_head: [B, K, D] -> [B, K, 1] -> squeeze -> [B, K]
+        plasticity = self.plasticity_head(clean_signal).squeeze(-1)  # [B, K]
+        
         plasticity = plasticity * self.config.improvement_lr
+        
+        # Update value: [B, K, D] -> [B, K, D]
+        # self.update_val is Linear(D, D)
+        updates = self.update_val(clean_signal) 
 
-        # Factored per-prototype updates via outer product
-        key = torch.sigmoid(self.update_key(clean_signal)).squeeze(0)  # [num_prototypes]
-        val = self.update_val(clean_signal).squeeze(0)                 # [code_dim]
-        updates = key.unsqueeze(-1) * val.unsqueeze(0)  # [num_prototypes, code_dim]
-
-        # Clamp magnitude for stability
-        update_norms = updates.norm(dim=-1, keepdim=True)
+        # Soft saturation instead of hard clamping for better gradients
+        # updates = max_norm * tanh(updates / max_norm)
         max_norm = self.config.improvement_max_magnitude
-        updates = updates * torch.clamp(max_norm / (update_norms + 1e-8), max=1.0)
-
+        updates = max_norm * torch.tanh(updates / max_norm)
+        
+        if average_updates:
+            updates = updates.mean(dim=0)          # [K, D]
+            plasticity = plasticity.mean(dim=0)    # [K]
+        
         return updates, plasticity
+
+    def get_update_delta(
+        self, 
+        improvement_signal: torch.Tensor,
+        average_updates: bool = True
+    ) -> torch.Tensor:
+        """Calculate the full update delta (updates * plasticity).
+
+        Args:
+            improvement_signal: [batch, variant_code_dim]
+            average_updates: passed to compute_update
+
+        Returns:
+            delta: [K, D] or [B, K, D]
+        """
+        updates, plasticity = self.compute_update(improvement_signal, average_updates=average_updates)
+        # Apply plasticity scaling
+        # plasticity is [K] or [B, K], updates is [K, D] or [B, K, D]
+        # Need to unsqueeze last dim
+        return updates * plasticity.unsqueeze(-1)
 
     @torch.no_grad()
     def apply_improvement(
@@ -160,16 +190,19 @@ class SelfImprovementEngine(nn.Module):
     def get_improvement_loss(
         self,
         improvement_signal: torch.Tensor,
+        group_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """Compute a training loss that encourages useful improvement signals.
 
         The loss encourages:
         1. Improvement signals to be non-trivial (not zero)
-        2. Improvement signals to be consistent within a batch
+        2. Improvement signals to be consistent within a batch (or within groups)
         3. Resulting updates to have bounded magnitude
 
         Args:
             improvement_signal: [batch, variant_code_dim]
+            group_ids: Optional [batch] tensor of group IDs (e.g. task IDs)
+                       to enforce consistency only within groups.
 
         Returns:
             Scalar loss
@@ -178,9 +211,23 @@ class SelfImprovementEngine(nn.Module):
         signal_magnitude = improvement_signal.norm(dim=-1).mean()
         magnitude_loss = torch.exp(-signal_magnitude)  # Penalize near-zero signals
 
-        # Encourage consistency within batch
-        mean_signal = improvement_signal.mean(dim=0, keepdim=True)
-        consistency_loss = (improvement_signal - mean_signal).norm(dim=-1).mean()
+        # Encourage consistency within batch (or groups)
+        if group_ids is None:
+            mean_signal = improvement_signal.mean(dim=0, keepdim=True)
+            consistency_loss = (improvement_signal - mean_signal).norm(dim=-1).mean()
+        else:
+            # Vectorized grouped mean calculation
+            unique_groups = torch.unique(group_ids)
+            consistency_loss = 0.0
+            for gid in unique_groups:
+                mask = (group_ids == gid)
+                if not mask.any():
+                    continue
+                group_signals = improvement_signal[mask]
+                mean_signal = group_signals.mean(dim=0, keepdim=True)
+                consistency_loss += (group_signals - mean_signal).norm(dim=-1).mean()
+            if len(unique_groups) > 0:
+                consistency_loss /= len(unique_groups)
 
         # Compute update and penalize extreme plasticity
         updates, plasticity = self.compute_update(improvement_signal.detach())

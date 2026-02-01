@@ -35,6 +35,7 @@ class VariantModulation:
     gammas: list      # List of [batch, hidden_dim] scale tensors per layer
     betas: list       # List of [batch, hidden_dim] shift tensors per layer
     context: torch.Tensor  # [batch, variant_code_dim] — injected context
+    param_weights: torch.Tensor = None # [batch, num_prototypes] — attention weights
 
 
 class FiLMLayer(nn.Module):

@@ -31,8 +31,8 @@ class RVAConfig:
     ema_blend: float = 0.1          # Blend factor for cross-recursion EMA into state
 
     # --- Self-improvement ---
-    improvement_lr: float = 1e-3    # Base learning rate for self-improvement
-    improvement_momentum: float = 0.9
+    improvement_lr: float = 0.01    # Base learning rate for self-improvement
+    improvement_momentum: float = 0.0 # Clean alignment with meta-loss (no history lag)
     improvement_max_magnitude: float = 0.1  # Clamp update magnitude
     enable_self_improvement: bool = True
 

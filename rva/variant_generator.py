@@ -99,31 +99,56 @@ class VariantGenerator(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def _attend_variant_memory(self, state: torch.Tensor) -> torch.Tensor:
+    def _attend_variant_memory(
+        self,
+        state: torch.Tensor,
+        ephemeral_memory: torch.Tensor = None,
+    ) -> torch.Tensor:
         """Soft attention over variant memory prototypes.
 
         Args:
             state: [batch, state_dim]
+            ephemeral_memory: Optional override. Can be [num_prototypes, code_dim]
+                              OR [batch, num_prototypes, code_dim]
 
         Returns:
             [batch, variant_code_dim] — weighted combination of prototypes
         """
+        # Use provided memory or the learned parameter
+        memory = ephemeral_memory if ephemeral_memory is not None else self.variant_memory
+
         # query: [batch, variant_code_dim]
         query = self.memory_query(state)
 
-        # Attention scores: [batch, num_prototypes]
-        scores = torch.matmul(query, self.variant_memory.t()) / math.sqrt(self.config.variant_code_dim)
-        weights = F.softmax(scores, dim=-1)
+        if memory.dim() == 2:
+            # Memory is shared [K, D]
+            # Attention scores: [batch, num_prototypes]
+            scores = torch.matmul(query, memory.t()) / math.sqrt(self.config.variant_code_dim)
+            weights = F.softmax(scores, dim=-1)
 
-        # Weighted readout: [batch, variant_code_dim]
-        readout = torch.matmul(weights, self.variant_memory)
-        return self.memory_out(readout)
+            # Weighted readout: [batch, variant_code_dim]
+            readout = torch.matmul(weights, memory)
+
+        else:
+            # Memory is batched [B, K, D]
+            # query: [B, D] -> [B, 1, D]
+            # memory trans: [B, D, K]
+            # scores: [B, 1, K]
+            scores = torch.matmul(query.unsqueeze(1), memory.transpose(-1, -2))
+            scores = scores / math.sqrt(self.config.variant_code_dim)
+            weights = F.softmax(scores, dim=-1) # [B, 1, K]
+
+            # Weighted readout: [B, 1, K] @ [B, K, D] -> [B, 1, D]
+            readout = torch.matmul(weights, memory).squeeze(1)
+
+        return self.memory_out(readout), weights
 
     def forward(
         self,
         state: torch.Tensor,
         depth: torch.Tensor,
         training: bool = False,
+        ephemeral_memory: torch.Tensor = None,
     ) -> VariantModulation:
         """Generate variant modulation for the current recursion level.
 
@@ -131,6 +156,7 @@ class VariantGenerator(nn.Module):
             state: [batch, state_dim]
             depth: [batch] integer tensor of current recursion depth
             training: if True, add noise for regularization
+            ephemeral_memory: Optional [num_prototypes, code_dim] override for variant memory
 
         Returns:
             VariantModulation with FiLM params and context
@@ -139,7 +165,7 @@ class VariantGenerator(nn.Module):
         depth_emb = sinusoidal_embedding(depth, self.config.depth_embed_dim)
 
         # 2. Attend to variant memory
-        memory_readout = self._attend_variant_memory(state)
+        memory_readout, weights = self._attend_variant_memory(state, ephemeral_memory)
 
         # 3. Concatenate all conditioning signals
         vg_input = torch.cat([state, depth_emb, memory_readout], dim=-1)
@@ -176,4 +202,5 @@ class VariantGenerator(nn.Module):
             gammas=gammas,
             betas=betas,
             context=context,
+            param_weights=weights.squeeze(1) if weights.dim() == 3 else weights
         )

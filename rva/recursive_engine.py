@@ -73,6 +73,7 @@ class RecursiveEngine(nn.Module):
         training: bool = False,
         max_depth_override: Optional[int] = None,
         return_all_states: bool = False,
+        ephemeral_memory: torch.Tensor = None,
     ) -> RecursionOutput:
         """Run the recursive loop.
 
@@ -82,6 +83,7 @@ class RecursiveEngine(nn.Module):
             training:       enables variant noise and forces min depth
             max_depth_override: override max recursion depth
             return_all_states: if True, collect all intermediate states
+            ephemeral_memory: Optional override for variant memory
 
         Returns:
             RecursionOutput with final state, metadata, and improvement signals
@@ -101,9 +103,15 @@ class RecursiveEngine(nn.Module):
         cumulative_halt = torch.zeros(batch_size, 1, device=device)
         num_steps = torch.zeros(batch_size, device=device)
 
-        # Improvement accumulation
-        improve_accum = torch.zeros(batch_size, config.variant_code_dim, device=device)
-        improve_weight_sum = torch.zeros(batch_size, 1, device=device)
+        # Improvement accumulation - NOW [batch, num_prototypes, code_dim]
+        # We accumulate specific signals for each prototype based on attention
+        improve_accum = torch.zeros(
+            batch_size, config.num_variant_prototypes, config.variant_code_dim, 
+            device=device
+        )
+        
+        # We don't need improve_weight_sum anymore because we trust the attention weights magnitude
+        # (Softmax sums to 1 per step, so we are averaging over the "attention mass" allocated)
 
         # Output state accumulator (weighted by halt probability)
         output_state = torch.zeros_like(state)
@@ -121,8 +129,14 @@ class RecursiveEngine(nn.Module):
             # Normalize state for stability in deep recursion
             normed_state = self.state_norm(state)
 
-            # 1. Generate variant for this depth
-            modulation = self.variant_gen(normed_state, depth, training=training)
+            # 1. Generate variant for this depth (using ephemeral memory if provided)
+            #    Now returns param_weights in modulation!
+            modulation = self.variant_gen(
+                normed_state,
+                depth,
+                training=training,
+                ephemeral_memory=ephemeral_memory
+            )
 
             # 2. Apply kernel with variant modulation
             #    Pass raw memory so the kernel's gated residual operates on
@@ -173,8 +187,16 @@ class RecursiveEngine(nn.Module):
 
             # Accumulate improvement signals (depth-weighted: earlier = more trusted)
             depth_weight = 1.0 / (1.0 + step * 0.1)
-            improve_accum = improve_accum + depth_weight * kernel_out.improvement * still_active_f
-            improve_weight_sum = improve_weight_sum + depth_weight * still_active_f
+            
+            # ATTENTION-AWARE ACCUMULATION
+            # weights: [batch, num_prototypes]
+            # signal:  [batch, code_dim]
+            # distributed: [batch, num_prototypes, code_dim]
+            weights = modulation.param_weights * still_active_f
+            signal = kernel_out.improvement
+            distributed_signal = weights.unsqueeze(-1) * signal.unsqueeze(1)
+            
+            improve_accum = improve_accum + depth_weight * distributed_signal
 
             # Update state and memory for samples still active
             state = torch.where(still_active.unsqueeze(-1), new_state, state)
@@ -191,9 +213,13 @@ class RecursiveEngine(nn.Module):
         remainder = 1.0 - cumulative_halt
         output_state = output_state + remainder * state
         output_memory = output_memory + remainder * memory
-
-        # Normalize improvement accumulator
-        improve_accum = improve_accum / (improve_weight_sum + 1e-8)
+        
+        # Normalize improvement accumulator??
+        # Actually, since we sum depth-weighted attention, the magnitude is somewhat
+        # self-regulated. Dividing by "sum of attention" might destabilize rare prototypes.
+        # Let's trust the accumulation magnitude or normalize by active steps.
+        # Simple normalization: divide by steps to keep scale invariant of recursion depth.
+        improve_accum = improve_accum / (num_steps.unsqueeze(-1).unsqueeze(-1) + 1e-8)
 
         return RecursionOutput(
             final_state=output_state,

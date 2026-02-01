@@ -107,31 +107,76 @@ def train_epoch(
         optimizer.zero_grad()
 
         # Forward
-        output = model(inputs)
+        # Forward pass 1 (Before improvement)
+        output_1 = model(inputs)
+        losses_1 = output_1.compute_loss(targets, config)
 
-        # Compute losses
-        losses = output.compute_loss(targets, config)
+        # Meta-Learning Step: Look-ahead
+        # 1. Calculate what update the model WANTS to make based on this batch
+        #    Use average_updates=False to let each sample compute its own IDEAL update.
+        #    This provides richer gradients than averaging the signal first.
+        delta = model.compute_update_delta(output_1.improvement_signal, average_updates=False)
 
-        # Add improvement quality loss during training
-        improve_loss = model.self_improve.get_improvement_loss(output.improvement_signal)
-        losses["improve"] = improve_loss
-        losses["total"] = losses["total"] + config.meta_loss_weight * improve_loss
+        # 2. Run the model AGAIN (on the same batch or a split) with this update applied TEMPORARILY
+        #    Note: delta is now [Batch, K, D], so Model/VariantGen will use per-sample memory.
+        #    Note: Ideally we'd use a separate "validation" batch (x_similar), but for this
+        #    synthetic task, using the same batch is an acceptable proxy for "improving on similar data".
+        #    Using the same batch also stabilizes the gradient signal.
+        current_memory = model.recursive_engine.variant_gen.variant_memory
+        output_2 = model(inputs, ephemeral_memory=current_memory + delta)
+        losses_2 = output_2.compute_loss(targets, config)
+
+        # 3. Compute Meta-Loss
+        #    We want loss_2 < loss_1.
+        #    meta_loss = relu(loss_2 - loss_1 + margin)
+        #    If loss_2 improved significantly, loss is 0. If not, we penalize.
+        margin = 0.01
+        # Detach loss_1 because we don't want to optimize the "before" state to be worse,
+        # we only want to optimize the "update" to make the "after" state better.
+        improvement_gap = losses_2["task"] - losses_1["task"].detach() + margin
+        meta_loss = F.relu(improvement_gap)
+
+        # Total Loss
+        # We combine:
+        # 1. Base task loss (model should still solve the task)
+        # 2. Ponder cost (efficiency)
+        # 3. Meta loss (improvement ability)
+        # 4. Heuristic consistency loss (regularization) from the SIE
+        heuristic_loss = model.self_improve.get_improvement_loss(output_1.improvement_signal)
+
+        batch_loss = (
+            losses_1["task"] +
+            losses_1["ponder"] * config.ponder_cost +
+            meta_loss * config.meta_loss_weight +
+            heuristic_loss
+        )
+
+        losses = {
+            "total": batch_loss,
+            "task": losses_1["task"],
+            "ponder": losses_1["ponder"],
+            "meta": meta_loss,
+            "improve": heuristic_loss
+        }
 
         # Backward
-        losses["total"].backward()
+        optimizer.zero_grad()
+        batch_loss.backward()
 
         # Gradient clipping for stability in deep recursion
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
 
         optimizer.step()
 
-        # Self-improvement step (optional during training)
+        # Self-improvement step (optional during training - persistent update)
+        # In a true meta-learning setup, we often DON'T update the persistent memory during training,
+        # or we do it much slower. Here we keep it optional.
         if enable_self_improve:
-            model.self_improve_step(output.improvement_signal)
+            model.self_improve_step(output_1.improvement_signal)
 
         # Stats
-        stats = model.get_recursion_stats(output)
-        total_loss += losses["total"].item()
+        stats = model.get_recursion_stats(output_1)
+        total_loss += batch_loss.item()
         total_task_loss += losses["task"].item()
         total_ponder_loss += losses["ponder"].item()
         total_steps += stats["mean_depth"]
@@ -142,7 +187,7 @@ def train_epoch(
                 f"  Epoch {epoch} [{batch_idx}/{len(loader)}] "
                 f"loss={losses['total'].item():.4f} "
                 f"task={losses['task'].item():.4f} "
-                f"ponder={losses['ponder'].item():.4f} "
+                f"meta={losses['meta'].item():.4f} "
                 f"depth={stats['mean_depth']:.1f}"
             )
 

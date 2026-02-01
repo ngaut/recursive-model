@@ -191,6 +191,7 @@ class RVAModel(nn.Module):
         x: torch.Tensor,
         max_depth_override: Optional[int] = None,
         return_all_states: bool = False,
+        ephemeral_memory: torch.Tensor = None,
     ) -> RVAOutput:
         """Full forward pass: encode → recurse → decode.
 
@@ -198,6 +199,7 @@ class RVAModel(nn.Module):
             x: [batch, input_dim] or [batch] (if using vocab)
             max_depth_override: override max recursion depth
             return_all_states: collect all intermediate states
+            ephemeral_memory: Optional override for variant memory
 
         Returns:
             RVAOutput with logits, state, and metadata
@@ -214,6 +216,7 @@ class RVAModel(nn.Module):
             training=training,
             max_depth_override=max_depth_override,
             return_all_states=return_all_states,
+            ephemeral_memory=ephemeral_memory,
         )
 
         # 3. Decode
@@ -225,6 +228,19 @@ class RVAModel(nn.Module):
             recursion_output=rec_output,
             improvement_signal=rec_output.improvement_accumulator,
         )
+
+    def compute_update_delta(
+        self,
+        improvement_signal: torch.Tensor,
+        average_updates: bool = True
+    ) -> torch.Tensor:
+        """Compute safe update delta for meta-learning loop.
+        
+        Args:
+            improvement_signal: [batch, variant_code_dim]
+            average_updates: if False, return batched deltas [Batch, K, D]
+        """
+        return self.self_improve.get_update_delta(improvement_signal, average_updates=average_updates)
 
     @torch.no_grad()
     def self_improve_step(self, improvement_signal: torch.Tensor) -> dict:

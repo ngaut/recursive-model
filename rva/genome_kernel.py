@@ -102,6 +102,7 @@ class GenomeKernel(nn.Module):
         self.improve_head = nn.Linear(config.hidden_dim, config.variant_code_dim)
 
         self.dropout = nn.Dropout(config.kernel_dropout)
+        self.final_norm = nn.LayerNorm(config.hidden_dim)
 
     def forward(
         self,
@@ -125,8 +126,18 @@ class GenomeKernel(nn.Module):
         for i, layer in enumerate(self.layers):
             gamma = modulation.gammas[i] if i < len(modulation.gammas) else None
             beta = modulation.betas[i] if i < len(modulation.betas) else None
-            x = layer(x, gamma, beta)
-            x = self.dropout(x)
+            
+            out = layer(x, gamma, beta)
+            out = self.dropout(out)
+            
+            # Residual connection for layers > 0 (where dims match)
+            if i > 0:
+                x = x + out
+            else:
+                x = out
+
+        # Final normalization before heads
+        x = self.final_norm(x)
 
         # Compute all output heads
         new_state = self.state_head(x)

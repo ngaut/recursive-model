@@ -68,7 +68,8 @@ def test_recursive_engine_flow(config):
 def test_self_improvement_update(config):
     sie = SelfImprovementEngine(config)
     batch_size = 5
-    signal = torch.randn(batch_size, config.variant_code_dim)
+    # Signal is now [B, K, D] (distributed per prototype)
+    signal = torch.randn(batch_size, config.num_variant_prototypes, config.variant_code_dim)
     
     # Check update computation
     updates, plasticity = sie.compute_update(signal)

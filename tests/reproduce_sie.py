@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from rva.config import RVAConfig
 from rva.model import RVAModel
-from train import SequenceTask, train_epoch
+from rva.tasks import SequenceTask
 
-# Alias for compatibility if needed, or just use SequenceTask
+# Alias for compatibility
 SortTask = lambda **kwargs: SequenceTask(task="sort", **kwargs)
 
 def verify_inference_improvement():
@@ -27,20 +29,25 @@ def verify_inference_improvement():
     model = RVAModel(config).to(device)
     
     # 2. Brief Training (Alignment Phase)
-    # We need to train the model so it learns HOW to improve.
-    # Random weights = Random signals = Random updates = No improvement.
     print("-> Training for 50 steps to align meta-gradients...")
     optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     task = SortTask(seq_len=8, num_samples=1000, max_val=64)
-    # Create a small loader
-    # Create a small loader
-    from torch.utils.data import DataLoader
     loader = DataLoader(task, batch_size=16, shuffle=True)
     
     model.train()
-    # We use our train_epoch logic which includes the meta-loss loop
-    # train_epoch iterates over the loader
-    train_epoch(model, loader, optimizer, config, epoch=1, device=device, enable_self_improve=True)
+    # Simple training loop (inline instead of external train_epoch)
+    for i, (inputs, targets) in enumerate(loader):
+        if i >= 50:
+            break
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        output = model(inputs)
+        loss = F.mse_loss(output.logits, targets)
+        if config.enable_self_improvement:
+            meta_loss = model.self_improve.get_improvement_loss(output.improvement_signal)
+            loss = loss + meta_loss
+        loss.backward()
+        optimizer.step()
     
     # 3. Verification Phase
     print("\n-> Switching to EVAL mode (Weights Frozen).")

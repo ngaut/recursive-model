@@ -137,9 +137,11 @@ class VariantGenerator(nn.Module):
             scores = torch.matmul(query.unsqueeze(1), memory.transpose(-1, -2))
             scores = scores / math.sqrt(self.config.variant_code_dim)
             weights = F.softmax(scores, dim=-1) # [B, 1, K]
-
+            
             # Weighted readout: [B, 1, K] @ [B, K, D] -> [B, 1, D]
             readout = torch.matmul(weights, memory).squeeze(1)
+
+
 
         return self.memory_out(readout), weights
 

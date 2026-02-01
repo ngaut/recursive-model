@@ -88,22 +88,31 @@ class Encoder(nn.Module):
         else:
             self.embedding = None
 
-        # Input → state
-        self.to_state = nn.Sequential(
-            nn.Linear(config.input_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-            nn.GELU(),
-            nn.Linear(config.hidden_dim, config.state_dim),
-            nn.LayerNorm(config.state_dim),
+        # GRU Encoder (replaces Mean Pooling)
+        # Bidirectional to capture full context (e.g., variable dependencies)
+        # Hidden dim is config.hidden_dim (split 50/50 for bi-dir)
+        self.encoder_gru = nn.GRU(
+            input_size=config.input_dim,
+            hidden_size=config.hidden_dim // 2,
+            num_layers=getattr(config, 'encoder_layers', 2),
+            batch_first=True,
+            bidirectional=True,
+            dropout=config.dropout if getattr(config, 'encoder_layers', 2) > 1 else 0.0
         )
 
-        # Input → memory
-        self.to_memory = nn.Sequential(
-            nn.Linear(config.input_dim, config.memory_dim * 2),
-            nn.GELU(),
-            nn.Linear(config.memory_dim * 2, config.memory_dim),
-            nn.LayerNorm(config.memory_dim),
-        )
+        # Attention Mechanism (Multi-Query)
+        self.num_heads = getattr(config, 'num_attention_heads', 4)
+        self.attention_query = nn.Parameter(torch.randn(self.num_heads, config.hidden_dim))
+        self.attention_key = nn.Linear(config.hidden_dim, config.hidden_dim)
+        
+        # Map Attention Output to State/Memory
+        # Input is concatenated context from all heads: [batch, num_heads * hidden]
+        flat_dim = self.num_heads * config.hidden_dim
+        self.to_state = nn.Linear(flat_dim, config.state_dim)
+        self.state_norm = nn.LayerNorm(config.state_dim)
+
+        self.to_memory = nn.Linear(flat_dim, config.memory_dim)
+        self.memory_norm = nn.LayerNorm(config.memory_dim)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -116,11 +125,43 @@ class Encoder(nn.Module):
         """
         if self.embedding is not None and x.dtype == torch.long:
             x = self.embedding(x)
-            if x.dim() == 3:
-                x = x.mean(dim=1)  # Pool over sequence for initial state
+        
+        # If input is [batch, dim] (not sequence), unsqueeze
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
 
-        state = self.to_state(x)
-        memory = self.to_memory(x)
+        # Pass through GRU
+        # out: [batch, seq, hidden_dim]
+        out, _ = self.encoder_gru(x)
+        
+        # Multi-Query Attention
+        # query: [num_heads, hidden] -> [batch, num_heads, hidden]
+        batch_size = x.size(0)
+        query = self.attention_query.expand(batch_size, -1, -1)
+        
+        # keys: [batch, seq, hidden]
+        keys = self.attention_key(out)
+        
+        # scores: [batch, num_heads, seq]
+        # query: [B, H, D]
+        # keys.T: [B, D, S]
+        # scores: [B, H, S]
+        scores = torch.bmm(query, keys.transpose(1, 2)) / (self.config.hidden_dim ** 0.5)
+        
+        weights = F.softmax(scores, dim=-1)
+        
+        # context: [batch, num_heads, hidden]
+        # weights: [B, H, S]
+        # out: [B, S, D]
+        context = torch.bmm(weights, out)
+        
+        # Flatten heads
+        # [batch, num_heads * hidden]
+        context = context.view(batch_size, -1)
+        
+        state = self.state_norm(self.to_state(context))
+        memory = self.memory_norm(self.to_memory(context))
+        
         return state, memory
 
 
@@ -188,31 +229,27 @@ class RVAModel(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        inputs: torch.Tensor,
         max_depth_override: Optional[int] = None,
         return_all_states: bool = False,
         ephemeral_memory: torch.Tensor = None,
     ) -> RVAOutput:
-        """Full forward pass: encode → recurse → decode.
-
+        """
         Args:
-            x: [batch, input_dim] or [batch] (if using vocab)
-            max_depth_override: override max recursion depth
-            return_all_states: collect all intermediate states
-            ephemeral_memory: Optional override for variant memory
-
-        Returns:
-            RVAOutput with logits, state, and metadata
+            inputs: [batch, seq_len, input_dim] (or raw inputs if embedding used)
+            max_depth_override: Force a specific recursion depth
+            return_all_states: Return trace of all states (for inspection)
+            ephemeral_memory: Optional override for variant memory (TTT support)
         """
         training = self.training
 
         # 1. Encode
-        state, memory = self.encoder(x)
+        initial_state, initial_memory = self.encoder(inputs)
 
-        # 2. Recursive processing
+        # 2. Recurse (The "Thinking" Process)
         rec_output = self.recursive_engine(
-            initial_state=state,
-            initial_memory=memory,
+            initial_state=initial_state,
+            initial_memory=initial_memory,
             training=training,
             max_depth_override=max_depth_override,
             return_all_states=return_all_states,
@@ -237,12 +274,11 @@ class RVAModel(nn.Module):
         """Compute safe update delta for meta-learning loop.
         
         Args:
-            improvement_signal: [batch, variant_code_dim]
+            improvement_signal: [batch, num_prototypes, variant_code_dim]
             average_updates: if False, return batched deltas [Batch, K, D]
         """
         return self.self_improve.get_update_delta(improvement_signal, average_updates=average_updates)
 
-    @torch.no_grad()
     def self_improve_step(self, improvement_signal: torch.Tensor) -> dict:
         """Apply a self-improvement step using accumulated improvement signals.
 
@@ -250,13 +286,18 @@ class RVAModel(nn.Module):
         from the RVAOutput.
 
         Args:
-            improvement_signal: [batch, variant_code_dim]
+            improvement_signal: [batch, num_prototypes, variant_code_dim]
 
         Returns:
             Dict with improvement statistics
         """
         variant_memory = self.recursive_engine.variant_gen.variant_memory
         return self.self_improve.apply_improvement(variant_memory, improvement_signal)
+
+    @property
+    def variant_memory(self) -> torch.Tensor:
+        """Access the variant memory parameter for gradient inspection."""
+        return self.recursive_engine.variant_gen.variant_memory
 
     def count_parameters(self) -> dict:
         """Count parameters by component."""

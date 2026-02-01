@@ -1,20 +1,3 @@
-"""
-Self-Improvement Engine — the model's ability to evolve at inference time.
-
-This is the most radical component of RVA. Instead of requiring separate training
-phases with gradient descent, the model continuously improves itself through
-learned improvement signals.
-
-The key insight: we don't modify the core weights (too dangerous). Instead, we
-modify the **variant memory** — the bank of prototype vectors that influence how
-variants are generated. Changing variant memory changes the lens through which
-the genome kernel is applied, effectively changing all computation without
-touching the kernel itself.
-
-Think of it as: you can't change your DNA, but you can change your habits,
-environment, and mental models. The variant memory is the model's "mental model
-of how to think."
-"""
 
 import torch
 import torch.nn as nn
@@ -103,6 +86,11 @@ class SelfImprovementEngine(nn.Module):
         # plasticity_head: [B, K, D] -> [B, K, 1] -> squeeze -> [B, K]
         plasticity = self.plasticity_head(clean_signal).squeeze(-1)  # [B, K]
         
+        # PLASTICITY INJECTION (Fix 2026-01-31)
+        # Prevent collapse by clamping to minimum
+        if hasattr(self.config, 'plasticity_min'):
+            plasticity = torch.clamp(plasticity, min=self.config.plasticity_min)
+            
         plasticity = plasticity * self.config.improvement_lr
         
         # Update value: [B, K, D] -> [B, K, D]
@@ -154,7 +142,7 @@ class SelfImprovementEngine(nn.Module):
 
         Args:
             variant_memory: [num_prototypes, variant_code_dim] — the live parameter
-            improvement_signal: [batch, variant_code_dim]
+            improvement_signal: [batch, num_prototypes, variant_code_dim]
 
         Returns:
             Dict with improvement statistics
@@ -198,6 +186,7 @@ class SelfImprovementEngine(nn.Module):
         1. Improvement signals to be non-trivial (not zero)
         2. Improvement signals to be consistent within a batch (or within groups)
         3. Resulting updates to have bounded magnitude
+        4. Plasticity to stay near target (Plasticity Injection)
 
         Args:
             improvement_signal: [batch, variant_code_dim]
@@ -230,7 +219,31 @@ class SelfImprovementEngine(nn.Module):
                 consistency_loss /= len(unique_groups)
 
         # Compute update and penalize extreme plasticity
-        updates, plasticity = self.compute_update(improvement_signal.detach())
-        plasticity_reg = (plasticity ** 2).mean()  # Keep plasticity moderate
+        # Note: We rely on clamped plasticity in compute_update, but for loss we want gradients
+        # to push the raw prediction. 
+        # Actually, self.plasticity_head is what we train.
+        updates, plasticity = self.compute_update(improvement_signal)
+        
+        # PLASTICITY TARGET REGULARIZATION (Fix 2026-01-31)
+        # Pull plasticity towards target (e.g. 0.05)
+        # We use the raw plasticity (before clamp if possible? No, clamp kills grad for low values).
+        # We want to encourage the head to output something that results in reasonable plasticity.
+        # Since we clamp in compute_update, if it's below min, it gets clamped.
+        # If we just regularize the output of compute_update, it works.
+        target = getattr(self.config, 'plasticity_target', 0.05)
+        reg_weight = getattr(self.config, 'plasticity_reg_weight', 1.0)
+        
+        plasticity_reg = (plasticity - target).pow(2).mean() * reg_weight
+        
+        # ENTROPY REGULARIZATION (2026 SOTA - Encourage Decisive Plasticity)
+        # Minimize entropy of plasticity to encourage p near 0 (stable) or p near 1 (rapid adaptation)
+        # p is in [0, 1] (sigmoid output)
+        # H(p) = -p*log(p) - (1-p)*log(1-p)
+        # We clamp for numerical stability
+        p_safe = torch.clamp(plasticity, 1e-6, 1.0 - 1e-6)
+        entropy = -(p_safe * torch.log(p_safe) + (1 - p_safe) * torch.log(1 - p_safe)).mean()
+        
+        # Small weight for entropy (e.g., 0.01) so it doesn't override target binding
+        entropy_weight = 0.01
 
-        return magnitude_loss + 0.1 * consistency_loss + 0.01 * plasticity_reg
+        return magnitude_loss + 0.1 * consistency_loss + plasticity_reg + entropy_weight * entropy
